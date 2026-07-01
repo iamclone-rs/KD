@@ -64,6 +64,7 @@ class Model(pl.LightningModule):
         self.teacher_std = CLIP_STD
         self.teacher_dtype = torch.float32
         self.teacher_feature_cache = {}
+        self._teacher_precomputed = False
         self._init_teacher()
 
     def _init_teacher(self):
@@ -225,18 +226,23 @@ class Model(pl.LightningModule):
             for path, feat in zip(batch_paths, feats):
                 self.teacher_feature_cache[path] = feat
 
-    def on_fit_start(self):
+    def on_train_start(self):
         if (
             self.opts.distill_teacher == 'none'
             or self.opts.distill_weight <= 0
             or not self.opts.cache_teacher_features
             or not self.opts.precompute_teacher_features
+            or self._teacher_precomputed
         ):
             return
 
-        train_dataloader = self.trainer.train_dataloader
+        train_dataloader = getattr(self.trainer, 'train_dataloader', None)
+        if train_dataloader is None:
+            train_dataloader = getattr(self.trainer, 'train_dataloaders', None)
         if isinstance(train_dataloader, (list, tuple)):
             train_dataloader = train_dataloader[0]
+        if train_dataloader is None or not hasattr(train_dataloader, 'dataset'):
+            return
         train_dataset = train_dataloader.dataset
         self._precompute_teacher_cache(
             train_dataset,
@@ -252,6 +258,7 @@ class Model(pl.LightningModule):
             self.teacher_device = torch.device('cpu')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        self._teacher_precomputed = True
 
     def distillation_loss(self, sk_tensor, img_tensor, sk_feat, img_feat, sk_paths, img_paths):
         if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
