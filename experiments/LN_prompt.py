@@ -38,8 +38,14 @@ if __name__ == '__main__':
     train_dataset = Sketchy(opts, dataset_transforms, mode='train', return_orig=False)
     val_dataset = Sketchy(opts, dataset_transforms, mode='val', used_cat=train_dataset.all_categories, return_orig=False)
 
-    train_loader = DataLoader(dataset=train_dataset, batch_size=opts.batch_size, num_workers=opts.workers, shuffle=True)
-    val_loader = DataLoader(dataset=val_dataset, batch_size=opts.batch_size, num_workers=opts.workers)
+    loader_kwargs = {
+        'batch_size': opts.batch_size,
+        'num_workers': opts.workers,
+        'pin_memory': torch.cuda.is_available(),
+        'persistent_workers': opts.workers > 0,
+    }
+    train_loader = DataLoader(dataset=train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(dataset=val_dataset, **loader_kwargs)
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
 

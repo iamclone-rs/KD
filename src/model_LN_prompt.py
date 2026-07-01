@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from tqdm.auto import tqdm
 
 from src.clip import clip
 from experiments.options import opts
@@ -173,62 +174,123 @@ class Model(pl.LightningModule):
                 teacher_feats.append(F.normalize(teacher_feat.float(), dim=-1))
         return torch.cat(teacher_feats, dim=0)
 
-    def teacher_encode_photo_batch(self, img_tensor, img_paths):
-        if not self.opts.cache_teacher_features:
-            return self.teacher_encode_image(img_tensor)
+    def teacher_encode_path_batch(self, image_tensor, image_paths):
+        if not self.opts.cache_teacher_features or any(path is None for path in image_paths):
+            return self.teacher_encode_image(image_tensor)
 
         cached_feats = []
         missing_indices = []
         missing_images = []
 
-        for idx, path in enumerate(img_paths):
+        for idx, path in enumerate(image_paths):
             if path in self.teacher_feature_cache:
-                cached_feats.append(self.teacher_feature_cache[path].to(self.device))
+                cached_feats.append(self.teacher_feature_cache[path].to(self.device).float())
             else:
                 cached_feats.append(None)
                 missing_indices.append(idx)
-                missing_images.append(img_tensor[idx])
+                missing_images.append(image_tensor[idx])
 
         if missing_images:
             missing_batch = torch.stack(missing_images, dim=0)
-            missing_feats = self.teacher_encode_image(missing_batch).detach().cpu()
-            for path, feat in zip([img_paths[idx] for idx in missing_indices], missing_feats):
+            missing_feats = self.teacher_encode_image(missing_batch).detach().cpu().half()
+            for path, feat in zip([image_paths[idx] for idx in missing_indices], missing_feats):
                 self.teacher_feature_cache[path] = feat
 
         feats = [
-            self.teacher_feature_cache[path].to(self.device)
+            self.teacher_feature_cache[path].to(self.device).float()
             if feat is None else feat
-            for path, feat in zip(img_paths, cached_feats)
+            for path, feat in zip(image_paths, cached_feats)
         ]
         return torch.stack(feats, dim=0)
 
-    def distillation_loss(self, img_tensor, img_feat, img_paths):
+    def _precompute_teacher_cache(self, dataset, paths, desc):
+        if not paths:
+            return
+
+        missing_paths = [path for path in dict.fromkeys(paths) if path not in self.teacher_feature_cache]
+        if not missing_paths:
+            return
+
+        for start in tqdm(
+            range(0, len(missing_paths), self.opts.teacher_batch_size),
+            desc=desc,
+            dynamic_ncols=True,
+            leave=True):
+            batch_paths = missing_paths[start:start + self.opts.teacher_batch_size]
+            batch = torch.stack([
+                dataset.transform(dataset.load_image(path))
+                for path in batch_paths
+            ]).to(self.device)
+            feats = self.teacher_encode_image(batch).detach().cpu().half()
+            for path, feat in zip(batch_paths, feats):
+                self.teacher_feature_cache[path] = feat
+
+    def on_fit_start(self):
+        if (
+            self.opts.distill_teacher == 'none'
+            or self.opts.distill_weight <= 0
+            or not self.opts.cache_teacher_features
+            or not self.opts.precompute_teacher_features
+        ):
+            return
+
+        train_dataloader = self.trainer.train_dataloader
+        if isinstance(train_dataloader, (list, tuple)):
+            train_dataloader = train_dataloader[0]
+        train_dataset = train_dataloader.dataset
+        self._precompute_teacher_cache(
+            train_dataset,
+            train_dataset.all_photo_paths,
+            'Precompute DFN photo')
+        self._precompute_teacher_cache(
+            train_dataset,
+            train_dataset.all_sketches_path,
+            'Precompute DFN sketch')
+        teacher = self.teacher_model[0]
+        if teacher is not None:
+            teacher.to('cpu')
+            self.teacher_device = torch.device('cpu')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def distillation_loss(self, sk_tensor, img_tensor, sk_feat, img_feat, sk_paths, img_paths):
         if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
             return img_feat.new_tensor(0.0)
 
-        teacher_img_feat = self.teacher_encode_photo_batch(img_tensor, img_paths)
+        teacher_sk_feat = self.teacher_encode_path_batch(sk_tensor, sk_paths)
+        teacher_img_feat = self.teacher_encode_path_batch(img_tensor, img_paths)
         temperature = self.opts.distill_temperature
 
+        student_sk_feat = F.normalize(sk_feat.float(), dim=-1)
         student_img_feat = F.normalize(img_feat.float(), dim=-1)
-        student_logits = student_img_feat @ student_img_feat.t() / temperature
-        teacher_logits = teacher_img_feat @ teacher_img_feat.t() / temperature
+        student_logits = student_sk_feat @ student_img_feat.t() / temperature
+        teacher_logits = teacher_sk_feat @ teacher_img_feat.t() / temperature
 
-        loss = F.kl_div(
+        loss_sk_to_img = F.kl_div(
             F.log_softmax(student_logits, dim=1),
             F.softmax(teacher_logits, dim=1),
             reduction='batchmean')
-        return loss * (temperature ** 2)
+        loss_img_to_sk = F.kl_div(
+            F.log_softmax(student_logits.t(), dim=1),
+            F.softmax(teacher_logits.t(), dim=1),
+            reduction='batchmean')
+        return 0.5 * (loss_sk_to_img + loss_img_to_sk) * (temperature ** 2)
 
     def training_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
-        img_paths = batch[5] if len(batch) > 5 else [None] * img_tensor.size(0)
+        if len(batch) > 6:
+            sk_paths = batch[5]
+            img_paths = batch[6]
+        else:
+            sk_paths = [None] * sk_tensor.size(0)
+            img_paths = [None] * img_tensor.size(0)
         img_feat = self.forward(img_tensor, dtype='image')
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
-        distill_loss = self.distillation_loss(img_tensor, img_feat, img_paths)
+        distill_loss = self.distillation_loss(sk_tensor, img_tensor, sk_feat, img_feat, sk_paths, img_paths)
         loss = (
             triplet_loss
             + self.opts.cls_loss_weight * cls_loss
