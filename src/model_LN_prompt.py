@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchmetrics.functional import retrieval_average_precision
 import pytorch_lightning as pl
 
 from src.clip import clip
@@ -98,7 +97,7 @@ class Model(pl.LightningModule):
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
         loss = triplet_loss + self.opts.cls_loss_weight * cls_loss
         batch_size = sk_tensor.size(0)
-        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_cls_loss', cls_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
@@ -110,7 +109,7 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=sk_tensor.size(0))
+        self.log('val_loss', loss, on_step=False, on_epoch=True, batch_size=sk_tensor.size(0))
         self.val_step_outputs.append((sk_feat.detach(), list(category)))
 
     def _get_validation_dataset(self):
@@ -134,6 +133,8 @@ class Model(pl.LightningModule):
                 ]).to(self.device)
                 gallery_feats.append(self.forward(batch, dtype='image').detach())
 
+        if len(gallery_feats) == 0:
+            raise RuntimeError('Validation gallery is empty. Check data_dir, dataset split, and photo folders.')
         return torch.cat(gallery_feats)
 
     def on_validation_epoch_start(self):
@@ -150,19 +151,42 @@ class Model(pl.LightningModule):
         gallery_category_all = np.array(val_dataset.all_photo_categories)
 
 
-        ## mAP category-level SBIR Metrics
-        gallery = gallery_feat_all
-        ap = torch.zeros(len(query_feat_all))
-        for idx, sk_feat in enumerate(query_feat_all):
-            category = query_category_all[idx]
-            distance = -1*self.distance_fn(sk_feat.unsqueeze(0), gallery)
-            target = torch.zeros(len(gallery), dtype=torch.bool)
-            target[np.where(gallery_category_all == category)] = True
-            ap[idx] = retrieval_average_precision(distance.cpu(), target.cpu())
-        
-        mAP = torch.mean(ap)
+        query_feat_all = F.normalize(query_feat_all.float(), dim=-1)
+        gallery_feat_all = F.normalize(gallery_feat_all.float(), dim=-1)
+
+        ap = []
+        missing_positive = 0
+        eval_batch_size = self.opts.batch_size
+        for start in range(0, len(query_feat_all), eval_batch_size):
+            end = start + eval_batch_size
+            scores_batch = query_feat_all[start:end] @ gallery_feat_all.t()
+            categories_batch = query_category_all[start:end]
+
+            for local_idx, scores in enumerate(scores_batch):
+                category = categories_batch[local_idx]
+                target_np = gallery_category_all == category
+                if not np.any(target_np):
+                    missing_positive += 1
+                    continue
+
+                target = torch.from_numpy(target_np).to(scores.device)
+                order = torch.argsort(scores, descending=True)
+                target = target[order].float()
+                precision = torch.cumsum(target, dim=0) / torch.arange(
+                    1, target.numel() + 1, device=target.device, dtype=torch.float32)
+                ap.append((precision * target).sum() / target.sum())
+
+        if len(ap) == 0:
+            mAP = torch.tensor(0.0, device=self.device)
+        else:
+            mAP = torch.stack(ap).mean()
+
         if self.global_step > 0:
             self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        self.log('mAP', mAP, prog_bar=True)
-        self.log('best_mAP', self.best_metric, prog_bar=True)
+        self.log('mAP', mAP)
+        self.log('best_mAP', self.best_metric)
+        val_loss = self.trainer.callback_metrics.get('val_loss')
+        val_loss_text = 'n/a' if val_loss is None else '{:.4f}'.format(float(val_loss))
+        print('val epoch {} | val_loss: {} | mAP: {:.4f} | best_mAP: {:.4f} | missing_positive_queries: {}'.format(
+            self.current_epoch, val_loss_text, mAP.item(), self.best_metric, missing_positive))
         self.val_step_outputs = []

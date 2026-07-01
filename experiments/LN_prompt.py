@@ -1,13 +1,36 @@
 import os
 import torch
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
 from src.model_LN_prompt import Model
 from src.dataset_retrieval import Sketchy
 from experiments.options import opts
+
+class TrainProgressBar(Callback):
+    def __init__(self):
+        super().__init__()
+        self.progress_bar = None
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        total = trainer.num_training_batches
+        self.progress_bar = tqdm(
+            total=total,
+            desc='Epoch {}/{}'.format(trainer.current_epoch + 1, trainer.max_epochs),
+            dynamic_ncols=True,
+            leave=True)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, *args, **kwargs):
+        if self.progress_bar is not None:
+            self.progress_bar.update(1)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.progress_bar is not None:
+            self.progress_bar.close()
+            self.progress_bar = None
 
 if __name__ == '__main__':
     dataset_transforms = Sketchy.data_transform(opts)
@@ -48,7 +71,9 @@ if __name__ == '__main__':
         # accumulate_grad_batches=1,
         check_val_every_n_epoch=1,
         log_every_n_steps=10,
-        callbacks=[checkpoint_callback]
+        enable_progress_bar=False,
+        num_sanity_val_steps=0,
+        callbacks=[checkpoint_callback, TrainProgressBar()]
     )
 
     if ckpt_path is None:
