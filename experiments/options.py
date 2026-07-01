@@ -8,8 +8,13 @@ parser.add_argument('--exp_name', type=str, default='LN_prompt')
 # DataLoader Options
 # --------------------
 
-# Path to 'Sketchy' folder holding Sketch_extended dataset. It should have 2 folders named 'sketch' and 'photo'.
-parser.add_argument('--data_dir', type=str, default='/isize2/sain/data/Sketchy/') 
+# Path to dataset root. It should have sketch/photo folders with class subfolders.
+parser.add_argument('--data_dir', type=str, default='/isize2/sain/data/Sketchy/')
+parser.add_argument(
+    '--dataset',
+    type=str,
+    default='sketchy_2',
+    choices=['sketchy', 'sketchy_1', 'sketchy_2', 'tuberlin', 'quickdraw'])
 parser.add_argument('--max_size', type=int, default=224)
 parser.add_argument('--nclass', type=int, default=10)
 parser.add_argument('--data_split', type=float, default=-1.0)

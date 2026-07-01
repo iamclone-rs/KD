@@ -5,29 +5,7 @@ import torch
 from torchvision import transforms
 from PIL import Image, ImageOps
 
-unseen_classes = [
-    "bat",
-    "cabin",
-    "cow",
-    "dolphin",
-    "door",
-    "giraffe",
-    "helicopter",
-    "mouse",
-    "pear",
-    "raccoon",
-    "rhinoceros",
-    "saw",
-    "scissors",
-    "seagull",
-    "skyscraper",
-    "songbird",
-    "sword",
-    "tree",
-    "wheelchair",
-    "windmill",
-    "window",
-]
+from src.data_config import UNSEEN_CLASSES
 
 class Sketchy(torch.utils.data.Dataset):
 
@@ -36,11 +14,16 @@ class Sketchy(torch.utils.data.Dataset):
         self.opts = opts
         self.transform = transform
         self.return_orig = return_orig
+        self.mode = mode
 
+        self._init_dataset(mode, used_cat)
+
+    def _init_dataset(self, mode, used_cat=None):
         self.all_categories = sorted(os.listdir(os.path.join(self.opts.data_dir, 'sketch')))
         if '.ipynb_checkpoints' in self.all_categories:
             self.all_categories.remove('.ipynb_checkpoints')
-            
+
+        unseen_classes = UNSEEN_CLASSES[self.opts.dataset]
         if self.opts.data_split > 0:
             np.random.shuffle(self.all_categories)
             if used_cat is None:
@@ -53,21 +36,31 @@ class Sketchy(torch.utils.data.Dataset):
                 unseen_cat = set(unseen_classes)
                 self.all_categories = [cat for cat in self.all_categories if cat not in unseen_cat]
             else:
-                self.all_categories = unseen_classes
+                available_cat = set(self.all_categories)
+                self.all_categories = [cat for cat in unseen_classes if cat in available_cat]
 
         self.all_sketches_path = []
+        self.all_sketch_categories = []
         self.all_photos_path = {}
         self.all_photo_paths = []
         self.all_photo_categories = []
 
         for category in self.all_categories:
-            sketch_paths = sorted(glob.glob(os.path.join(self.opts.data_dir, 'sketch', category, '*.png')))
-            photo_paths = sorted(glob.glob(os.path.join(self.opts.data_dir, 'photo', category, '*.jpg')))
+            sketch_paths = self._list_images(os.path.join(self.opts.data_dir, 'sketch', category))
+            photo_paths = self._list_images(os.path.join(self.opts.data_dir, 'photo', category))
 
             self.all_sketches_path.extend(sketch_paths)
+            self.all_sketch_categories.extend([category] * len(sketch_paths))
             self.all_photos_path[category] = photo_paths
             self.all_photo_paths.extend(photo_paths)
             self.all_photo_categories.extend([category] * len(photo_paths))
+
+    def _list_images(self, folder):
+        extensions = ('*.png', '*.jpg', '*.jpeg', '*.JPEG', '*.bmp')
+        paths = []
+        for extension in extensions:
+            paths.extend(glob.glob(os.path.join(folder, extension)))
+        return sorted(paths)
 
     def __len__(self):
         return len(self.all_sketches_path)
@@ -80,8 +73,8 @@ class Sketchy(torch.utils.data.Dataset):
         return image
         
     def __getitem__(self, index):
-        filepath = self.all_sketches_path[index]                
-        category = filepath.split(os.path.sep)[-2]
+        filepath = self.all_sketches_path[index]
+        category = self.all_sketch_categories[index]
         filename = os.path.basename(filepath)
         
         neg_classes = self.all_categories.copy()

@@ -52,6 +52,7 @@ class Model(pl.LightningModule):
             distance_function=self.distance_fn, margin=self.opts.margin)
 
         self.best_metric = -1e3
+        self.val_step_outputs = []
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
@@ -109,7 +110,7 @@ class Model(pl.LightningModule):
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         self.log('val_loss', loss)
-        return sk_feat, category
+        self.val_step_outputs.append((sk_feat.detach(), list(category)))
 
     def _get_validation_dataset(self):
         val_dataloaders = self.trainer.val_dataloaders
@@ -134,12 +135,15 @@ class Model(pl.LightningModule):
 
         return torch.cat(gallery_feats)
 
-    def validation_epoch_end(self, val_step_outputs):
-        Len = len(val_step_outputs)
+    def on_validation_epoch_start(self):
+        self.val_step_outputs = []
+
+    def on_validation_epoch_end(self):
+        Len = len(self.val_step_outputs)
         if Len == 0:
             return
-        query_feat_all = torch.cat([val_step_outputs[i][0] for i in range(Len)])
-        query_category_all = np.array(sum([list(val_step_outputs[i][1]) for i in range(Len)], []))
+        query_feat_all = torch.cat([self.val_step_outputs[i][0] for i in range(Len)])
+        query_category_all = np.array(sum([self.val_step_outputs[i][1] for i in range(Len)], []))
         val_dataset = self._get_validation_dataset()
         gallery_feat_all = self._encode_validation_gallery(val_dataset)
         gallery_category_all = np.array(val_dataset.all_photo_categories)
@@ -160,3 +164,4 @@ class Model(pl.LightningModule):
             self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
         self.log('mAP', mAP, prog_bar=True)
         self.log('best_mAP', self.best_metric, prog_bar=True)
+        self.val_step_outputs = []

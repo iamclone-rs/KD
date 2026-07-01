@@ -1,7 +1,6 @@
 import os
-import glob
+import torch
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from pytorch_lightning import Trainer
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -34,14 +33,18 @@ if __name__ == '__main__':
     else:
         print ('resuming training from %s'%ckpt_path)
 
-    trainer = Trainer(gpus=-1,
+    accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+    devices = 1 if torch.cuda.is_available() else 'auto'
+
+    trainer = Trainer(
+        accelerator=accelerator,
+        devices=devices,
         min_epochs=1, max_epochs=2000,
         benchmark=True,
         logger=logger,
         # val_check_interval=10, 
         # accumulate_grad_batches=1,
         check_val_every_n_epoch=5,
-        resume_from_checkpoint=ckpt_path,
         callbacks=[checkpoint_callback]
     )
 
@@ -52,4 +55,4 @@ if __name__ == '__main__':
         model = Model.load_from_checkpoint(ckpt_path, class_names=train_dataset.all_categories, strict=False)
 
     print ('beginning training...good luck...')
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=ckpt_path)
