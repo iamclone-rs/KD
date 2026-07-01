@@ -61,6 +61,8 @@ class Model(pl.LightningModule):
         self.teacher_input_size = self.opts.teacher_input_size
         self.teacher_mean = CLIP_MEAN
         self.teacher_std = CLIP_STD
+        self.teacher_dtype = torch.float32
+        self.teacher_feature_cache = {}
         self._init_teacher()
 
     def _init_teacher(self):
@@ -79,6 +81,12 @@ class Model(pl.LightningModule):
         teacher, _, preprocess_val = open_clip.create_model_and_transforms(DFN5B_HF_ID)
         teacher.eval()
         teacher.requires_grad_(False)
+        if self.opts.precision == '16-mixed':
+            teacher = teacher.half()
+            self.teacher_dtype = torch.float16
+        elif self.opts.precision == 'bf16-mixed':
+            teacher = teacher.bfloat16()
+            self.teacher_dtype = torch.bfloat16
         self.teacher_model[0] = teacher
         self._set_teacher_preprocess(preprocess_val)
 
@@ -116,7 +124,7 @@ class Model(pl.LightningModule):
             align_corners=False)
         teacher_mean = torch.tensor(self.teacher_mean, device=images.device, dtype=dtype).view(1, 3, 1, 1)
         teacher_std = torch.tensor(self.teacher_std, device=images.device, dtype=dtype).view(1, 3, 1, 1)
-        return (images - teacher_mean) / teacher_std
+        return ((images - teacher_mean) / teacher_std).to(dtype=self.teacher_dtype)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
@@ -157,7 +165,7 @@ class Model(pl.LightningModule):
         if teacher is None:
             return None
         teacher_feats = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for start in range(0, images.size(0), self.opts.teacher_batch_size):
                 batch = images[start:start + self.opts.teacher_batch_size]
                 teacher_images = self._prepare_teacher_input(batch)
@@ -165,38 +173,62 @@ class Model(pl.LightningModule):
                 teacher_feats.append(F.normalize(teacher_feat.float(), dim=-1))
         return torch.cat(teacher_feats, dim=0)
 
-    def distillation_loss(self, sk_tensor, img_tensor, sk_feat, img_feat):
-        if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
-            return sk_feat.new_tensor(0.0)
+    def teacher_encode_photo_batch(self, img_tensor, img_paths):
+        if not self.opts.cache_teacher_features:
+            return self.teacher_encode_image(img_tensor)
 
-        teacher_sk_feat = self.teacher_encode_image(sk_tensor)
-        teacher_img_feat = self.teacher_encode_image(img_tensor)
+        cached_feats = []
+        missing_indices = []
+        missing_images = []
+
+        for idx, path in enumerate(img_paths):
+            if path in self.teacher_feature_cache:
+                cached_feats.append(self.teacher_feature_cache[path].to(self.device))
+            else:
+                cached_feats.append(None)
+                missing_indices.append(idx)
+                missing_images.append(img_tensor[idx])
+
+        if missing_images:
+            missing_batch = torch.stack(missing_images, dim=0)
+            missing_feats = self.teacher_encode_image(missing_batch).detach().cpu()
+            for path, feat in zip([img_paths[idx] for idx in missing_indices], missing_feats):
+                self.teacher_feature_cache[path] = feat
+
+        feats = [
+            self.teacher_feature_cache[path].to(self.device)
+            if feat is None else feat
+            for path, feat in zip(img_paths, cached_feats)
+        ]
+        return torch.stack(feats, dim=0)
+
+    def distillation_loss(self, img_tensor, img_feat, img_paths):
+        if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
+            return img_feat.new_tensor(0.0)
+
+        teacher_img_feat = self.teacher_encode_photo_batch(img_tensor, img_paths)
         temperature = self.opts.distill_temperature
 
-        student_sk_feat = F.normalize(sk_feat.float(), dim=-1)
         student_img_feat = F.normalize(img_feat.float(), dim=-1)
-        student_logits = student_sk_feat @ student_img_feat.t() / temperature
-        teacher_logits = teacher_sk_feat @ teacher_img_feat.t() / temperature
+        student_logits = student_img_feat @ student_img_feat.t() / temperature
+        teacher_logits = teacher_img_feat @ teacher_img_feat.t() / temperature
 
-        loss_row = F.kl_div(
+        loss = F.kl_div(
             F.log_softmax(student_logits, dim=1),
             F.softmax(teacher_logits, dim=1),
             reduction='batchmean')
-        loss_col = F.kl_div(
-            F.log_softmax(student_logits.t(), dim=1),
-            F.softmax(teacher_logits.t(), dim=1),
-            reduction='batchmean')
-        return 0.5 * (loss_row + loss_col) * (temperature ** 2)
+        return loss * (temperature ** 2)
 
     def training_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
+        img_paths = batch[5] if len(batch) > 5 else [None] * img_tensor.size(0)
         img_feat = self.forward(img_tensor, dtype='image')
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
-        distill_loss = self.distillation_loss(sk_tensor, img_tensor, sk_feat, img_feat)
+        distill_loss = self.distillation_loss(img_tensor, img_feat, img_paths)
         loss = (
             triplet_loss
             + self.opts.cls_loss_weight * cls_loss
