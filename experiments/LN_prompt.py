@@ -44,10 +44,10 @@ if __name__ == '__main__':
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
 
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
+        monitor='main_metric',
         dirpath='saved_models/%s'%opts.exp_name,
-        filename="{epoch:02d}-{val_loss:.4f}",
-        mode='min',
+        filename="{epoch:02d}-{main_metric:.4f}",
+        mode='max',
         save_last=True)
 
     ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')

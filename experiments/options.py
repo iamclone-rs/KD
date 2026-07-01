@@ -31,6 +31,11 @@ parser.add_argument('--margin', type=float, default=0.3)
 parser.add_argument('--cls_loss_weight', type=float, default=0.5)
 parser.add_argument('--precision', type=str, default='16-mixed',
     choices=['16-mixed', 'bf16-mixed', '32-true'])
+parser.add_argument('--distill_teacher', type=str, default='none', choices=['none', 'dfn5b'])
+parser.add_argument('--distill_weight', type=float, default=0.0)
+parser.add_argument('--distill_temperature', type=float, default=0.07)
+parser.add_argument('--teacher_input_size', type=int, default=378)
+parser.add_argument('--teacher_batch_size', type=int, default=8)
 parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--workers', type=int, default=8)
 

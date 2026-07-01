@@ -8,6 +8,10 @@ import pytorch_lightning as pl
 from src.clip import clip
 from experiments.options import opts
 
+CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
+DFN5B_HF_ID = 'hf-hub:apple/DFN5B-CLIP-ViT-H-14-378'
+
 def freeze_model(m):
     m.requires_grad_(False)
 
@@ -52,6 +56,67 @@ class Model(pl.LightningModule):
 
         self.best_metric = -1e3
         self.val_step_outputs = []
+        self.teacher_model = [None]
+        self.teacher_device = None
+        self.teacher_input_size = self.opts.teacher_input_size
+        self.teacher_mean = CLIP_MEAN
+        self.teacher_std = CLIP_STD
+        self._init_teacher()
+
+    def _init_teacher(self):
+        if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
+            return
+        if self.opts.distill_teacher != 'dfn5b':
+            raise ValueError('Unsupported distillation teacher: {}'.format(self.opts.distill_teacher))
+        try:
+            import open_clip
+        except ImportError as exc:
+            raise ImportError(
+                'DFN5B distillation requires open_clip_torch. Install it with: '
+                'pip install open_clip_torch'
+            ) from exc
+
+        teacher, _, preprocess_val = open_clip.create_model_and_transforms(DFN5B_HF_ID)
+        teacher.eval()
+        teacher.requires_grad_(False)
+        self.teacher_model[0] = teacher
+        self._set_teacher_preprocess(preprocess_val)
+
+    def _set_teacher_preprocess(self, preprocess):
+        for transform in getattr(preprocess, 'transforms', []):
+            if transform.__class__.__name__ == 'Normalize':
+                self.teacher_mean = list(transform.mean)
+                self.teacher_std = list(transform.std)
+            elif transform.__class__.__name__ in ('Resize', 'CenterCrop'):
+                size = transform.size
+                if isinstance(size, (tuple, list)):
+                    self.teacher_input_size = int(size[0])
+                else:
+                    self.teacher_input_size = int(size)
+
+    def _get_teacher(self):
+        teacher = self.teacher_model[0]
+        if teacher is None:
+            return None
+        if self.teacher_device != self.device:
+            teacher.to(self.device)
+            teacher.eval()
+            self.teacher_device = self.device
+        return teacher
+
+    def _prepare_teacher_input(self, images):
+        dtype = images.dtype
+        clip_mean = torch.tensor(CLIP_MEAN, device=images.device, dtype=dtype).view(1, 3, 1, 1)
+        clip_std = torch.tensor(CLIP_STD, device=images.device, dtype=dtype).view(1, 3, 1, 1)
+        images = (images * clip_std + clip_mean).clamp(0, 1)
+        images = F.interpolate(
+            images,
+            size=(self.teacher_input_size, self.teacher_input_size),
+            mode='bicubic',
+            align_corners=False)
+        teacher_mean = torch.tensor(self.teacher_mean, device=images.device, dtype=dtype).view(1, 3, 1, 1)
+        teacher_std = torch.tensor(self.teacher_std, device=images.device, dtype=dtype).view(1, 3, 1, 1)
+        return (images - teacher_mean) / teacher_std
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([
@@ -87,6 +152,42 @@ class Model(pl.LightningModule):
         img_logits = logit_scale * F.normalize(img_feat, dim=-1) @ text_feat.t()
         return F.cross_entropy(sk_logits, labels) + F.cross_entropy(img_logits, labels)
 
+    def teacher_encode_image(self, images):
+        teacher = self._get_teacher()
+        if teacher is None:
+            return None
+        teacher_feats = []
+        with torch.no_grad():
+            for start in range(0, images.size(0), self.opts.teacher_batch_size):
+                batch = images[start:start + self.opts.teacher_batch_size]
+                teacher_images = self._prepare_teacher_input(batch)
+                teacher_feat = teacher.encode_image(teacher_images)
+                teacher_feats.append(F.normalize(teacher_feat.float(), dim=-1))
+        return torch.cat(teacher_feats, dim=0)
+
+    def distillation_loss(self, sk_tensor, img_tensor, sk_feat, img_feat):
+        if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
+            return sk_feat.new_tensor(0.0)
+
+        teacher_sk_feat = self.teacher_encode_image(sk_tensor)
+        teacher_img_feat = self.teacher_encode_image(img_tensor)
+        temperature = self.opts.distill_temperature
+
+        student_sk_feat = F.normalize(sk_feat.float(), dim=-1)
+        student_img_feat = F.normalize(img_feat.float(), dim=-1)
+        student_logits = student_sk_feat @ student_img_feat.t() / temperature
+        teacher_logits = teacher_sk_feat @ teacher_img_feat.t() / temperature
+
+        loss_row = F.kl_div(
+            F.log_softmax(student_logits, dim=1),
+            F.softmax(teacher_logits, dim=1),
+            reduction='batchmean')
+        loss_col = F.kl_div(
+            F.log_softmax(student_logits.t(), dim=1),
+            F.softmax(teacher_logits.t(), dim=1),
+            reduction='batchmean')
+        return 0.5 * (loss_row + loss_col) * (temperature ** 2)
+
     def training_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
         img_feat = self.forward(img_tensor, dtype='image')
@@ -95,11 +196,16 @@ class Model(pl.LightningModule):
 
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
-        loss = triplet_loss + self.opts.cls_loss_weight * cls_loss
+        distill_loss = self.distillation_loss(sk_tensor, img_tensor, sk_feat, img_feat)
+        loss = (
+            triplet_loss
+            + self.opts.cls_loss_weight * cls_loss
+            + self.opts.distill_weight * distill_loss)
         batch_size = sk_tensor.size(0)
         self.log('train_loss', loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_cls_loss', cls_loss, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('train_distill_loss', distill_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -137,6 +243,37 @@ class Model(pl.LightningModule):
             raise RuntimeError('Validation gallery is empty. Check data_dir, dataset split, and photo folders.')
         return torch.cat(gallery_feats)
 
+    def _metric_config(self):
+        if self.opts.dataset == 'sketchy_1':
+            return {
+                'map_k': None,
+                'precision_k': 100,
+                'map_name': 'mAP@all',
+                'precision_name': 'P@100',
+            }
+        if self.opts.dataset in ('sketchy', 'sketchy_2'):
+            return {
+                'map_k': 200,
+                'precision_k': 200,
+                'map_name': 'mAP@200',
+                'precision_name': 'P@200',
+            }
+        if self.opts.dataset == 'tuberlin':
+            return {
+                'map_k': None,
+                'precision_k': 100,
+                'map_name': 'mAP@all',
+                'precision_name': 'P@100',
+            }
+        if self.opts.dataset == 'quickdraw':
+            return {
+                'map_k': None,
+                'precision_k': 200,
+                'map_name': 'mAP@all',
+                'precision_name': 'P@200',
+            }
+        raise ValueError('Unsupported dataset for retrieval metrics: {}'.format(self.opts.dataset))
+
     def on_validation_epoch_start(self):
         self.val_step_outputs = []
 
@@ -154,7 +291,9 @@ class Model(pl.LightningModule):
         query_feat_all = F.normalize(query_feat_all.float(), dim=-1)
         gallery_feat_all = F.normalize(gallery_feat_all.float(), dim=-1)
 
+        metric_cfg = self._metric_config()
         ap = []
+        precision_at_k = []
         missing_positive = 0
         eval_batch_size = self.opts.batch_size
         for start in range(0, len(query_feat_all), eval_batch_size):
@@ -174,19 +313,41 @@ class Model(pl.LightningModule):
                 target = target[order].float()
                 precision = torch.cumsum(target, dim=0) / torch.arange(
                     1, target.numel() + 1, device=target.device, dtype=torch.float32)
-                ap.append((precision * target).sum() / target.sum())
+
+                if metric_cfg['map_k'] is None:
+                    ap_limit = target.numel()
+                    ap_denominator = target.sum()
+                else:
+                    ap_limit = min(metric_cfg['map_k'], target.numel())
+                    ap_denominator = torch.clamp(target.sum(), max=float(ap_limit))
+                ap.append((precision[:ap_limit] * target[:ap_limit]).sum() / ap_denominator)
+
+                p_limit = min(metric_cfg['precision_k'], target.numel())
+                precision_at_k.append(target[:p_limit].sum() / float(p_limit))
 
         if len(ap) == 0:
             mAP = torch.tensor(0.0, device=self.device)
+            precision_metric = torch.tensor(0.0, device=self.device)
         else:
             mAP = torch.stack(ap).mean()
+            precision_metric = torch.stack(precision_at_k).mean()
 
         if self.global_step > 0:
             self.best_metric = self.best_metric if  (self.best_metric > mAP.item()) else mAP.item()
-        self.log('mAP', mAP)
+        self.log(metric_cfg['map_name'], mAP)
+        self.log(metric_cfg['precision_name'], precision_metric)
+        self.log('main_metric', mAP)
         self.log('best_mAP', self.best_metric)
         val_loss = self.trainer.callback_metrics.get('val_loss')
         val_loss_text = 'n/a' if val_loss is None else '{:.4f}'.format(float(val_loss))
-        print('val epoch {} | val_loss: {} | mAP: {:.4f} | best_mAP: {:.4f} | missing_positive_queries: {}'.format(
-            self.current_epoch, val_loss_text, mAP.item(), self.best_metric, missing_positive))
+        print('val epoch {} | val_loss: {} | {}: {:.4f} | {}: {:.4f} | best_{}: {:.4f} | missing_positive_queries: {}'.format(
+            self.current_epoch,
+            val_loss_text,
+            metric_cfg['map_name'],
+            mAP.item(),
+            metric_cfg['precision_name'],
+            precision_metric.item(),
+            metric_cfg['map_name'],
+            self.best_metric,
+            missing_positive))
         self.val_step_outputs = []
