@@ -35,16 +35,19 @@ if __name__ == '__main__':
 
     accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
     devices = 1 if torch.cuda.is_available() else 'auto'
+    precision = opts.precision if torch.cuda.is_available() else '32-true'
 
     trainer = Trainer(
         accelerator=accelerator,
         devices=devices,
+        precision=precision,
         min_epochs=1, max_epochs=2000,
         benchmark=True,
         logger=logger,
         # val_check_interval=10, 
         # accumulate_grad_batches=1,
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,
+        log_every_n_steps=10,
         callbacks=[checkpoint_callback]
     )
 

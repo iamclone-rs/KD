@@ -97,9 +97,10 @@ class Model(pl.LightningModule):
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
         loss = triplet_loss + self.opts.cls_loss_weight * cls_loss
-        self.log('train_loss', loss)
-        self.log('train_triplet_loss', triplet_loss)
-        self.log('train_cls_loss', cls_loss)
+        batch_size = sk_tensor.size(0)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('train_cls_loss', cls_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -109,7 +110,7 @@ class Model(pl.LightningModule):
         neg_feat = self.forward(neg_tensor, dtype='image')
 
         loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        self.log('val_loss', loss)
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=sk_tensor.size(0))
         self.val_step_outputs.append((sk_feat.detach(), list(category)))
 
     def _get_validation_dataset(self):
