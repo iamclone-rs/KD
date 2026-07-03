@@ -55,6 +55,7 @@ parser.add_argument('--drop_last', action='store_true', default=False)
 # ----------------------
 parser.add_argument('--prompt_dim', type=int, default=768)
 parser.add_argument('--n_prompts', type=int, default=3)
+parser.add_argument('--prompt_arch', type=str, default='simple', choices=['simple', 'coprompt'])
 parser.add_argument('--prompt_init', type=str, default='random', choices=['random', 'clip_text'])
 parser.add_argument('--prompt_dropout', type=float, default=0.1)
 

@@ -28,6 +28,89 @@ def freeze_text_encoder(m):
         if not name.startswith('visual.'):
             param.requires_grad_(False)
 
+
+class TextEncoder(nn.Module):
+    def __init__(self, clip_model):
+        super().__init__()
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+
+    def forward(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.type(self.dtype)
+        x = x.permute(1, 0, 2)
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)
+        x = self.ln_final(x).type(self.dtype)
+
+        eot_indices = tokenized_prompts.argmax(dim=-1)
+        x = x[torch.arange(x.shape[0], device=x.device), eot_indices] @ self.text_projection
+        return x
+
+
+class MultiModalPromptLearner(nn.Module):
+    def __init__(self, opts, clip_model, class_names):
+        super().__init__()
+        self.opts = opts
+        self.class_names = [name.replace('_', ' ') for name in class_names]
+        self.n_cls = len(self.class_names)
+        self.n_ctx = opts.n_prompts
+        self.dtype = clip_model.dtype
+        self.ctx_dim = clip_model.ln_final.weight.shape[0]
+        self.visual_ctx_dim = clip_model.visual.ln_post.weight.shape[0]
+        self.prompt_dropout = nn.Dropout(p=opts.prompt_dropout)
+
+        # Keep a non-registered reference. Otherwise this prompt learner would
+        # duplicate the whole CLIP module in its parameter list.
+        self.__dict__['clip_model'] = clip_model
+
+        if opts.prompt_init == 'clip_text':
+            init_phrase = 'a photo/sketch of'
+            tokenized = clip.tokenize(init_phrase)
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(tokenized).type(self.dtype)
+            ctx_vectors = embedding[0, 1:1 + self.n_ctx, :].float()
+            self.prompt_prefix = init_phrase
+        else:
+            ctx_vectors = torch.empty(self.n_ctx, self.ctx_dim)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            self.prompt_prefix = ' '.join(['X'] * self.n_ctx)
+
+        self.ctx = nn.Parameter(ctx_vectors)
+        self.proj = nn.Linear(self.ctx_dim, self.visual_ctx_dim)
+        if self.dtype == torch.float16:
+            self.proj.half()
+
+    def construct_prompts(self, ctx, prefix, suffix):
+        return torch.cat([prefix, ctx, suffix], dim=1)
+
+    def visual_prompts(self):
+        return self.proj(self.ctx.type(self.proj.weight.dtype)).type(self.dtype)
+
+    def forward(self):
+        device = self.ctx.device
+        prompts = [self.prompt_prefix + ' ' + name + '.' for name in self.class_names]
+        tokenized_prompts = torch.cat([clip.tokenize(prompt) for prompt in prompts]).to(device)
+
+        with torch.no_grad():
+            embedding = self.clip_model.token_embedding(tokenized_prompts).type(self.dtype)
+
+        ctx = self.ctx
+        if self.training:
+            ctx = self.prompt_dropout(ctx)
+        ctx = ctx.type(self.dtype)
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+
+        prefix = embedding[:, :1, :]
+        suffix = embedding[:, 1 + self.n_ctx:, :]
+        text_prompts = self.construct_prompts(ctx, prefix, suffix)
+
+        return text_prompts, tokenized_prompts, self.visual_prompts()
+
+
 class Model(pl.LightningModule):
     def __init__(self, class_names=None):
         super().__init__()
@@ -50,9 +133,14 @@ class Model(pl.LightningModule):
         self.register_buffer('class_text_tokens', class_text_tokens, persistent=False)
 
         # Prompt Engineering
+        self.prompt_arch = self.opts.prompt_arch
         self.prompt_init = self.opts.prompt_init
         self.prompt_dropout = nn.Dropout(p=self.opts.prompt_dropout)
-        if self.prompt_init == 'clip_text':
+        if self.prompt_arch == 'coprompt':
+            self.prompt_learner_img = MultiModalPromptLearner(self.opts, self.clip, self.class_names)
+            self.prompt_learner_sk = MultiModalPromptLearner(self.opts, self.clip, self.class_names)
+            self.text_encoder = TextEncoder(self.clip)
+        elif self.prompt_init == 'clip_text':
             prompt = clip.tokenize('a photo/sketch of')
             with torch.no_grad():
                 embedding = self.clip.token_embedding(prompt).type(self.clip.dtype)
@@ -159,6 +247,12 @@ class Model(pl.LightningModule):
         return optimizer
 
     def prompt_parameters(self):
+        if self.prompt_arch == 'coprompt':
+            return (
+                [self.prompt_learner_sk.ctx, self.prompt_learner_img.ctx]
+                + list(self.prompt_learner_sk.proj.parameters())
+                + list(self.prompt_learner_img.proj.parameters())
+            )
         if self.prompt_init == 'clip_text':
             return (
                 [self.sk_prompt_ctx, self.img_prompt_ctx]
@@ -185,13 +279,34 @@ class Model(pl.LightningModule):
                 prompt = self.prompt_dropout(prompt)
         return prompt.type(dtype).expand(batch_size, -1, -1)
 
+    def coprompt_visual_prompt(self, batch_size, branch, dtype):
+        prompt_learner = self.prompt_learner_img if branch == 'image' else self.prompt_learner_sk
+        visual_prompts = prompt_learner.visual_prompts()
+        return visual_prompts.type(dtype).expand(batch_size, -1, -1)
+
+    def coprompt_text_features(self, branch):
+        prompt_learner = self.prompt_learner_img if branch == 'image' else self.prompt_learner_sk
+        text_prompts, tokenized_prompts, _ = prompt_learner()
+        text_features = self.text_encoder(text_prompts, tokenized_prompts)
+        return F.normalize(text_features, dim=-1)
+
     def forward(self, data, dtype='image'):
         if dtype == 'image':
+            prompt = (
+                self.coprompt_visual_prompt(data.shape[0], 'image', data.dtype)
+                if self.prompt_arch == 'coprompt'
+                else self.visual_prompt(data.dtype, data.shape[0], 'image')
+            )
             feat = self.clip.encode_image(
-                data, self.visual_prompt(data.dtype, data.shape[0], 'image'))
+                data, prompt)
         else:
+            prompt = (
+                self.coprompt_visual_prompt(data.shape[0], 'sketch', data.dtype)
+                if self.prompt_arch == 'coprompt'
+                else self.visual_prompt(data.dtype, data.shape[0], 'sketch')
+            )
             feat = self.sk_clip.encode_image(
-                data, self.visual_prompt(data.dtype, data.shape[0], 'sketch'))
+                data, prompt)
         return feat
 
     def classification_loss(self, sk_feat, img_feat, categories):
@@ -203,13 +318,19 @@ class Model(pl.LightningModule):
             dtype=torch.long,
             device=self.device)
 
-        with torch.no_grad():
-            text_feat = self.clip.encode_text(self.class_text_tokens.to(self.device))
-            text_feat = F.normalize(text_feat, dim=-1)
+        if self.prompt_arch == 'coprompt':
+            img_text_feat = self.coprompt_text_features('image')
+            sk_text_feat = self.coprompt_text_features('sketch')
+        else:
+            with torch.no_grad():
+                text_feat = self.clip.encode_text(self.class_text_tokens.to(self.device))
+                text_feat = F.normalize(text_feat, dim=-1)
+            img_text_feat = text_feat
+            sk_text_feat = text_feat
 
         logit_scale = self.clip.logit_scale.exp().detach()
-        sk_logits = logit_scale * F.normalize(sk_feat, dim=-1) @ text_feat.t()
-        img_logits = logit_scale * F.normalize(img_feat, dim=-1) @ text_feat.t()
+        sk_logits = logit_scale * F.normalize(sk_feat, dim=-1) @ sk_text_feat.t()
+        img_logits = logit_scale * F.normalize(img_feat, dim=-1) @ img_text_feat.t()
         return F.cross_entropy(sk_logits, labels) + F.cross_entropy(img_logits, labels)
 
     def nt_xent_loss(self, sk_feat, img_feat, categories=None):
@@ -363,8 +484,14 @@ class Model(pl.LightningModule):
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
-        triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
-        cls_loss = self.classification_loss(sk_feat, img_feat, category)
+        if self.opts.triplet_weight > 0:
+            triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
+        else:
+            triplet_loss = img_feat.new_tensor(0.0)
+        if self.opts.cls_loss_weight > 0:
+            cls_loss = self.classification_loss(sk_feat, img_feat, category)
+        else:
+            cls_loss = img_feat.new_tensor(0.0)
         if self.opts.nt_xent_weight > 0:
             nt_xent_loss = self.nt_xent_loss(sk_feat, img_feat, category)
         else:
