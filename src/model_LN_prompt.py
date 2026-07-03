@@ -51,6 +51,7 @@ class Model(pl.LightningModule):
 
         # Prompt Engineering
         self.prompt_init = self.opts.prompt_init
+        self.prompt_dropout = nn.Dropout(p=self.opts.prompt_dropout)
         if self.prompt_init == 'clip_text':
             prompt = clip.tokenize('a photo/sketch of')
             with torch.no_grad():
@@ -169,11 +170,19 @@ class Model(pl.LightningModule):
     def visual_prompt(self, dtype, batch_size, branch):
         if self.prompt_init == 'clip_text':
             if branch == 'image':
-                prompt = self.img_prompt_proj(self.img_prompt_ctx.type(dtype))
+                ctx = self.img_prompt_ctx
+                if self.training:
+                    ctx = self.prompt_dropout(ctx)
+                prompt = self.img_prompt_proj(ctx.type(dtype))
             else:
-                prompt = self.sk_prompt_proj(self.sk_prompt_ctx.type(dtype))
+                ctx = self.sk_prompt_ctx
+                if self.training:
+                    ctx = self.prompt_dropout(ctx)
+                prompt = self.sk_prompt_proj(ctx.type(dtype))
         else:
             prompt = self.img_prompt if branch == 'image' else self.sk_prompt
+            if self.training:
+                prompt = self.prompt_dropout(prompt)
         return prompt.type(dtype).expand(batch_size, -1, -1)
 
     def forward(self, data, dtype='image'):

@@ -66,7 +66,7 @@ if __name__ == '__main__':
     generator = torch.Generator()
     generator.manual_seed(opts.seed)
     loader_kwargs['generator'] = generator
-    train_loader = DataLoader(dataset=train_dataset, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(dataset=train_dataset, shuffle=True, drop_last=opts.drop_last, **loader_kwargs)
     val_loader = DataLoader(dataset=val_dataset, **loader_kwargs)
 
     logger = TensorBoardLogger('tb_logs', name=opts.exp_name)
@@ -79,7 +79,9 @@ if __name__ == '__main__':
         save_last=True)
 
     ckpt_path = os.path.join('saved_models', opts.exp_name, 'last.ckpt')
-    if not os.path.exists(ckpt_path):
+    if opts.no_resume:
+        ckpt_path = None
+    elif not os.path.exists(ckpt_path):
         ckpt_path = None
     else:
         print ('resuming training from %s'%ckpt_path)
