@@ -34,6 +34,10 @@ parser.add_argument('--nt_xent_weight', type=float, default=1.0)
 parser.add_argument('--nt_xent_temperature', type=float, default=0.07)
 parser.add_argument('--precision', type=str, default='16-mixed',
     choices=['16-mixed', 'bf16-mixed', '32-true'])
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--epochs', type=int, default=2000)
+parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd'])
+parser.add_argument('--train_text_encoder', action='store_true', default=False)
 parser.add_argument('--distill_teacher', type=str, default='none', choices=['none', 'dfn5b'])
 parser.add_argument('--distill_weight', type=float, default=0.0)
 parser.add_argument('--distill_temperature', type=float, default=0.07)
@@ -49,5 +53,6 @@ parser.add_argument('--workers', type=int, default=8)
 # ----------------------
 parser.add_argument('--prompt_dim', type=int, default=768)
 parser.add_argument('--n_prompts', type=int, default=3)
+parser.add_argument('--prompt_init', type=str, default='random', choices=['random', 'clip_text'])
 
 opts = parser.parse_args()

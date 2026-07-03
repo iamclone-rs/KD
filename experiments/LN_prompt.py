@@ -1,5 +1,7 @@
 import os
 import torch
+import random
+import numpy as np
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from pytorch_lightning import Trainer
@@ -9,6 +11,21 @@ from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from src.model_LN_prompt import Model
 from src.dataset_retrieval import Sketchy
 from experiments.options import opts
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 class TrainProgressBar(Callback):
     def __init__(self):
@@ -33,6 +50,7 @@ class TrainProgressBar(Callback):
             self.progress_bar = None
 
 if __name__ == '__main__':
+    seed_everything(opts.seed)
     dataset_transforms = Sketchy.data_transform(opts)
 
     train_dataset = Sketchy(opts, dataset_transforms, mode='train', return_orig=False)
@@ -43,7 +61,11 @@ if __name__ == '__main__':
         'num_workers': opts.workers,
         'pin_memory': torch.cuda.is_available(),
         'persistent_workers': opts.workers > 0,
+        'worker_init_fn': seed_worker,
     }
+    generator = torch.Generator()
+    generator.manual_seed(opts.seed)
+    loader_kwargs['generator'] = generator
     train_loader = DataLoader(dataset=train_dataset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(dataset=val_dataset, **loader_kwargs)
 
@@ -70,7 +92,7 @@ if __name__ == '__main__':
         accelerator=accelerator,
         devices=devices,
         precision=precision,
-        min_epochs=1, max_epochs=2000,
+        min_epochs=1, max_epochs=opts.epochs,
         benchmark=True,
         logger=logger,
         # val_check_interval=10, 

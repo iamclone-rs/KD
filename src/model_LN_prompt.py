@@ -35,8 +35,10 @@ class Model(pl.LightningModule):
         self.opts = opts
         self.clip, _ = clip.load('ViT-B/32', device=self.device)
         self.clip.apply(freeze_all_but_bn)
-        freeze_text_encoder(self.clip)
+        if not self.opts.train_text_encoder:
+            freeze_text_encoder(self.clip)
         self.sk_clip = copy.deepcopy(self.clip)
+        freeze_text_encoder(self.sk_clip)
 
         self.class_names = list(class_names) if class_names is not None else []
         self.category_to_idx = {category: idx for idx, category in enumerate(self.class_names)}
@@ -48,8 +50,22 @@ class Model(pl.LightningModule):
         self.register_buffer('class_text_tokens', class_text_tokens, persistent=False)
 
         # Prompt Engineering
-        self.sk_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
-        self.img_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
+        self.prompt_init = self.opts.prompt_init
+        if self.prompt_init == 'clip_text':
+            prompt = clip.tokenize('a photo/sketch of')
+            with torch.no_grad():
+                embedding = self.clip.token_embedding(prompt).type(self.clip.dtype)
+            text_ctx = embedding[0, 1:1 + self.opts.n_prompts, :].float()
+            self.sk_prompt_ctx = nn.Parameter(text_ctx.clone())
+            self.img_prompt_ctx = nn.Parameter(text_ctx.clone())
+            self.sk_prompt_proj = nn.Linear(text_ctx.shape[-1], self.opts.prompt_dim)
+            self.img_prompt_proj = nn.Linear(text_ctx.shape[-1], self.opts.prompt_dim)
+            if self.clip.dtype == torch.float16:
+                self.sk_prompt_proj.half()
+                self.img_prompt_proj.half()
+        else:
+            self.sk_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
+            self.img_prompt = nn.Parameter(torch.randn(self.opts.n_prompts, self.opts.prompt_dim))
 
         self.distance_fn = lambda x, y: 1.0 - F.cosine_similarity(x, y)
         self.loss_fn = nn.TripletMarginWithDistanceLoss(
@@ -129,19 +145,44 @@ class Model(pl.LightningModule):
         return ((images - teacher_mean) / teacher_std).to(dtype=self.teacher_dtype)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam([
+        prompt_params = self.prompt_parameters()
+        param_groups = [
             {'params': [p for p in self.clip.parameters() if p.requires_grad], 'lr': self.opts.clip_LN_lr},
             {'params': [p for p in self.sk_clip.parameters() if p.requires_grad], 'lr': self.opts.clip_LN_lr},
-            {'params': [self.sk_prompt] + [self.img_prompt], 'lr': self.opts.prompt_lr}])
+            {'params': prompt_params, 'lr': self.opts.prompt_lr},
+        ]
+        if self.opts.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=1e-3)
+        else:
+            optimizer = torch.optim.Adam(param_groups)
         return optimizer
+
+    def prompt_parameters(self):
+        if self.prompt_init == 'clip_text':
+            return (
+                [self.sk_prompt_ctx, self.img_prompt_ctx]
+                + list(self.sk_prompt_proj.parameters())
+                + list(self.img_prompt_proj.parameters())
+            )
+        return [self.sk_prompt, self.img_prompt]
+
+    def visual_prompt(self, dtype, batch_size, branch):
+        if self.prompt_init == 'clip_text':
+            if branch == 'image':
+                prompt = self.img_prompt_proj(self.img_prompt_ctx.type(dtype))
+            else:
+                prompt = self.sk_prompt_proj(self.sk_prompt_ctx.type(dtype))
+        else:
+            prompt = self.img_prompt if branch == 'image' else self.sk_prompt
+        return prompt.type(dtype).expand(batch_size, -1, -1)
 
     def forward(self, data, dtype='image'):
         if dtype == 'image':
             feat = self.clip.encode_image(
-                data, self.img_prompt.expand(data.shape[0], -1, -1))
+                data, self.visual_prompt(data.dtype, data.shape[0], 'image'))
         else:
             feat = self.sk_clip.encode_image(
-                data, self.sk_prompt.expand(data.shape[0], -1, -1))
+                data, self.visual_prompt(data.dtype, data.shape[0], 'sketch'))
         return feat
 
     def classification_loss(self, sk_feat, img_feat, categories):
