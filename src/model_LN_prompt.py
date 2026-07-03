@@ -111,6 +111,56 @@ class MultiModalPromptLearner(nn.Module):
         return text_prompts, tokenized_prompts, self.visual_prompts()
 
 
+def _count_params(module, trainable_only=False):
+    return sum(
+        p.numel()
+        for p in module.parameters()
+        if (p.requires_grad or not trainable_only)
+    )
+
+
+def _fmt_params(num_params):
+    if num_params >= 1_000_000:
+        return f"{num_params / 1_000_000:.2f}M"
+    if num_params >= 1_000:
+        return f"{num_params / 1_000:.1f}K"
+    return str(num_params)
+
+
+def _grad_stats(module):
+    params_with_grad = 0
+    elems_with_grad = 0
+    grad_sq_sum = 0.0
+    for p in module.parameters():
+        if p.grad is None:
+            continue
+        grad = p.grad.detach().float()
+        grad_norm = grad.norm().item()
+        if grad_norm == 0.0:
+            continue
+        params_with_grad += 1
+        elems_with_grad += p.numel()
+        grad_sq_sum += grad_norm ** 2
+    return params_with_grad, elems_with_grad, grad_sq_sum ** 0.5
+
+
+def _tensor_debug(name, value):
+    if value is None:
+        return f"  {name:<24} None"
+    if not torch.is_tensor(value):
+        return f"  {name:<24} {type(value).__name__}"
+
+    text = (
+        f"  {name:<24} shape={tuple(value.shape)} "
+        f"dtype={value.dtype} grad={value.requires_grad}"
+    )
+    if value.ndim >= 2 and value.shape[-1] > 1:
+        with torch.no_grad():
+            norm = value.detach().float().norm(dim=-1).mean().item()
+        text += f" mean_norm={norm:.4f}"
+    return text
+
+
 class Model(pl.LightningModule):
     def __init__(self, class_names=None):
         super().__init__()
@@ -171,6 +221,48 @@ class Model(pl.LightningModule):
         self.teacher_feature_cache = {}
         self._teacher_precomputed = False
         self._init_teacher()
+        self._feature_debug_printed = False
+        self._grad_debug_printed = False
+        self._print_model_debug_summary()
+
+    def _print_module_param_row(self, name, module):
+        total = _count_params(module)
+        trainable = _count_params(module, trainable_only=True)
+        print(
+            f"  {name:<24} trainable={_fmt_params(trainable):>8} / "
+            f"total={_fmt_params(total):>8}"
+        )
+
+    def _print_model_debug_summary(self):
+        print("=" * 78)
+        print("[Sketch_LVM Debug] Module parameter summary")
+        print(
+            f"[Sketch_LVM Debug] prompt_arch={self.prompt_arch}, "
+            f"prompt_init={self.prompt_init}, n_prompts={self.opts.n_prompts}"
+        )
+        self._print_module_param_row("Model", self)
+        self._print_module_param_row("clip", self.clip)
+        self._print_module_param_row("sk_clip", self.sk_clip)
+        if self.prompt_arch == 'coprompt':
+            self._print_module_param_row("prompt_learner_img", self.prompt_learner_img)
+            self._print_module_param_row("prompt_learner_sk", self.prompt_learner_sk)
+            self._print_module_param_row("text_encoder", self.text_encoder)
+        elif self.prompt_init == 'clip_text':
+            img_prompt_params = self.img_prompt_ctx.numel() + _count_params(self.img_prompt_proj)
+            sk_prompt_params = self.sk_prompt_ctx.numel() + _count_params(self.sk_prompt_proj)
+            print(f"  {'img ctx+proj only':<24} trainable={_fmt_params(img_prompt_params):>8} / total={_fmt_params(img_prompt_params):>8}")
+            print(f"  {'sk ctx+proj only':<24} trainable={_fmt_params(sk_prompt_params):>8} / total={_fmt_params(sk_prompt_params):>8}")
+        else:
+            print(f"  {'img_prompt':<24} trainable={_fmt_params(self.img_prompt.numel()):>8} / total={_fmt_params(self.img_prompt.numel()):>8}")
+            print(f"  {'sk_prompt':<24} trainable={_fmt_params(self.sk_prompt.numel()):>8} / total={_fmt_params(self.sk_prompt.numel()):>8}")
+        print(
+            "[Sketch_LVM Debug] Loss weights: "
+            f"cls={self.opts.cls_loss_weight}, "
+            f"triplet={self.opts.triplet_weight}, "
+            f"nt_xent={self.opts.nt_xent_weight}, "
+            f"distill={self.opts.distill_weight}"
+        )
+        print("=" * 78)
 
     def _init_teacher(self):
         if self.opts.distill_teacher == 'none' or self.opts.distill_weight <= 0:
@@ -244,6 +336,12 @@ class Model(pl.LightningModule):
             optimizer = torch.optim.SGD(param_groups, momentum=0.9, weight_decay=1e-3)
         else:
             optimizer = torch.optim.Adam(param_groups)
+        trainable = sum(p.numel() for group in optimizer.param_groups for p in group["params"] if p.requires_grad)
+        print(
+            f"[Sketch_LVM Debug] Optimizer: {self.opts.optimizer} "
+            f"clip_LN_lr={self.opts.clip_LN_lr}, prompt_lr={self.opts.prompt_lr}, "
+            f"trainable_params={_fmt_params(trainable)}"
+        )
         return optimizer
 
     def prompt_parameters(self):
@@ -484,6 +582,21 @@ class Model(pl.LightningModule):
         sk_feat = self.forward(sk_tensor, dtype='sketch')
         neg_feat = self.forward(neg_tensor, dtype='image')
 
+        if (
+            not self._feature_debug_printed
+            and batch_idx == 0
+            and getattr(self.trainer, "is_global_zero", True)
+        ):
+            print("=" * 78)
+            print("[Sketch_LVM Debug] First train batch feature contract")
+            print(_tensor_debug("img_feat_raw", img_feat))
+            print(_tensor_debug("sk_feat_raw", sk_feat))
+            print(_tensor_debug("neg_feat_raw", neg_feat))
+            print(_tensor_debug("sk_tensor", sk_tensor))
+            print(_tensor_debug("img_tensor", img_tensor))
+            print("=" * 78)
+            self._feature_debug_printed = True
+
         if self.opts.triplet_weight > 0:
             triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         else:
@@ -509,6 +622,57 @@ class Model(pl.LightningModule):
         self.log('train_nt_xent_loss', nt_xent_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_distill_loss', distill_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
+
+    def _print_grad_row(self, name, module):
+        params_with_grad, elems_with_grad, grad_norm = _grad_stats(module)
+        print(
+            f"  {name:<24} grad_params={params_with_grad:>4} "
+            f"grad_elems={_fmt_params(elems_with_grad):>8} grad_norm={grad_norm:.4e}"
+        )
+
+    def on_after_backward(self):
+        if self._grad_debug_printed or not getattr(self.trainer, "is_global_zero", True):
+            return
+
+        print("=" * 78)
+        print("[Sketch_LVM Debug] First backward non-zero gradient summary")
+        self._print_grad_row("Model", self)
+        self._print_grad_row("clip", self.clip)
+        self._print_grad_row("sk_clip", self.sk_clip)
+        if self.prompt_arch == 'coprompt':
+            self._print_grad_row("prompt_learner_img", self.prompt_learner_img)
+            self._print_grad_row("prompt_learner_sk", self.prompt_learner_sk)
+            self._print_grad_row("text_encoder", self.text_encoder)
+        elif self.prompt_init == 'clip_text':
+            img_grad = _grad_stats(self.img_prompt_proj)
+            sk_grad = _grad_stats(self.sk_prompt_proj)
+            print(
+                f"  {'img_prompt_ctx':<24} grad_params={int(self.img_prompt_ctx.grad is not None):>4} "
+                f"grad_elems={_fmt_params(self.img_prompt_ctx.numel() if self.img_prompt_ctx.grad is not None else 0):>8}"
+            )
+            print(
+                f"  {'sk_prompt_ctx':<24} grad_params={int(self.sk_prompt_ctx.grad is not None):>4} "
+                f"grad_elems={_fmt_params(self.sk_prompt_ctx.numel() if self.sk_prompt_ctx.grad is not None else 0):>8}"
+            )
+            print(
+                f"  {'img_prompt_proj':<24} grad_params={img_grad[0]:>4} "
+                f"grad_elems={_fmt_params(img_grad[1]):>8} grad_norm={img_grad[2]:.4e}"
+            )
+            print(
+                f"  {'sk_prompt_proj':<24} grad_params={sk_grad[0]:>4} "
+                f"grad_elems={_fmt_params(sk_grad[1]):>8} grad_norm={sk_grad[2]:.4e}"
+            )
+        else:
+            print(
+                f"  {'img_prompt':<24} grad_params={int(self.img_prompt.grad is not None):>4} "
+                f"grad_elems={_fmt_params(self.img_prompt.numel() if self.img_prompt.grad is not None else 0):>8}"
+            )
+            print(
+                f"  {'sk_prompt':<24} grad_params={int(self.sk_prompt.grad is not None):>4} "
+                f"grad_elems={_fmt_params(self.sk_prompt.numel() if self.sk_prompt.grad is not None else 0):>8}"
+            )
+        print("=" * 78)
+        self._grad_debug_printed = True
 
     def validation_step(self, batch, batch_idx):
         sk_tensor, img_tensor, neg_tensor, category = batch[:4]
