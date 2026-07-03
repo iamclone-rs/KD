@@ -162,25 +162,23 @@ class Model(pl.LightningModule):
         img_logits = logit_scale * F.normalize(img_feat, dim=-1) @ text_feat.t()
         return F.cross_entropy(sk_logits, labels) + F.cross_entropy(img_logits, labels)
 
-    def nt_xent_loss(self, sk_feat, img_feat, categories):
+    def nt_xent_loss(self, sk_feat, img_feat, categories=None):
         sk_feat = F.normalize(sk_feat.float(), dim=-1)
         img_feat = F.normalize(img_feat.float(), dim=-1)
-        logits = sk_feat @ img_feat.t() / self.opts.nt_xent_temperature
 
-        categories = np.array(list(categories))
-        positive_mask = torch.from_numpy(
-            categories[:, None] == categories[None, :]
-        ).to(logits.device)
+        batch_size = sk_feat.shape[0]
+        z = torch.cat([img_feat, sk_feat], dim=0)
+        logits = z @ z.t()
+        mask = torch.eye(2 * batch_size, dtype=torch.bool, device=logits.device)
+        logits = logits.masked_fill(mask, float('-inf'))
+        logits = logits / self.opts.nt_xent_temperature
 
-        sk_to_img_loss = -torch.logsumexp(
-            logits.masked_fill(~positive_mask, float('-inf')),
-            dim=1
-        ) + torch.logsumexp(logits, dim=1)
-        img_to_sk_loss = -torch.logsumexp(
-            logits.t().masked_fill(~positive_mask.t(), float('-inf')),
-            dim=1
-        ) + torch.logsumexp(logits.t(), dim=1)
-        return 0.5 * (sk_to_img_loss.mean() + img_to_sk_loss.mean())
+        labels = torch.cat([
+            torch.arange(batch_size, 2 * batch_size, device=logits.device),
+            torch.arange(0, batch_size, device=logits.device),
+        ], dim=0).long()
+
+        return F.cross_entropy(logits, labels)
 
     def teacher_encode_image(self, images):
         teacher = self._get_teacher()
