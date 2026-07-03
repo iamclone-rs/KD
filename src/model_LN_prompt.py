@@ -323,7 +323,7 @@ class Model(pl.LightningModule):
             nt_xent_loss = img_feat.new_tensor(0.0)
         distill_loss = self.distillation_loss(sk_tensor, img_tensor, sk_feat, img_feat, sk_paths, img_paths)
         loss = (
-            triplet_loss
+            self.opts.triplet_weight * triplet_loss
             + self.opts.cls_loss_weight * cls_loss
             + self.opts.nt_xent_weight * nt_xent_loss
             + self.opts.distill_weight * distill_loss)
