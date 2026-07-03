@@ -162,6 +162,26 @@ class Model(pl.LightningModule):
         img_logits = logit_scale * F.normalize(img_feat, dim=-1) @ text_feat.t()
         return F.cross_entropy(sk_logits, labels) + F.cross_entropy(img_logits, labels)
 
+    def nt_xent_loss(self, sk_feat, img_feat, categories):
+        sk_feat = F.normalize(sk_feat.float(), dim=-1)
+        img_feat = F.normalize(img_feat.float(), dim=-1)
+        logits = sk_feat @ img_feat.t() / self.opts.nt_xent_temperature
+
+        categories = np.array(list(categories))
+        positive_mask = torch.from_numpy(
+            categories[:, None] == categories[None, :]
+        ).to(logits.device)
+
+        sk_to_img_loss = -torch.logsumexp(
+            logits.masked_fill(~positive_mask, float('-inf')),
+            dim=1
+        ) + torch.logsumexp(logits, dim=1)
+        img_to_sk_loss = -torch.logsumexp(
+            logits.t().masked_fill(~positive_mask.t(), float('-inf')),
+            dim=1
+        ) + torch.logsumexp(logits.t(), dim=1)
+        return 0.5 * (sk_to_img_loss.mean() + img_to_sk_loss.mean())
+
     def teacher_encode_image(self, images):
         teacher = self._get_teacher()
         if teacher is None:
@@ -297,15 +317,21 @@ class Model(pl.LightningModule):
 
         triplet_loss = self.loss_fn(sk_feat, img_feat, neg_feat)
         cls_loss = self.classification_loss(sk_feat, img_feat, category)
+        if self.opts.nt_xent_weight > 0:
+            nt_xent_loss = self.nt_xent_loss(sk_feat, img_feat, category)
+        else:
+            nt_xent_loss = img_feat.new_tensor(0.0)
         distill_loss = self.distillation_loss(sk_tensor, img_tensor, sk_feat, img_feat, sk_paths, img_paths)
         loss = (
             triplet_loss
             + self.opts.cls_loss_weight * cls_loss
+            + self.opts.nt_xent_weight * nt_xent_loss
             + self.opts.distill_weight * distill_loss)
         batch_size = sk_tensor.size(0)
         self.log('train_loss', loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_triplet_loss', triplet_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_cls_loss', cls_loss, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log('train_nt_xent_loss', nt_xent_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         self.log('train_distill_loss', distill_loss, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
 

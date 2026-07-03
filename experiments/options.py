@@ -29,6 +29,8 @@ parser.add_argument('--prompt_lr', type=float, default=1e-5)
 parser.add_argument('--linear_lr', type=float, default=1e-4)
 parser.add_argument('--margin', type=float, default=0.3)
 parser.add_argument('--cls_loss_weight', type=float, default=0.5)
+parser.add_argument('--nt_xent_weight', type=float, default=1.0)
+parser.add_argument('--nt_xent_temperature', type=float, default=0.07)
 parser.add_argument('--precision', type=str, default='16-mixed',
     choices=['16-mixed', 'bf16-mixed', '32-true'])
 parser.add_argument('--distill_teacher', type=str, default='none', choices=['none', 'dfn5b'])
