@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from tqdm.auto import tqdm
+from torchmetrics.functional import retrieval_average_precision
 
 from src.clip import clip
 from experiments.options import opts
@@ -774,19 +775,15 @@ class Model(pl.LightningModule):
                     missing_positive += 1
                     continue
 
-                target = torch.from_numpy(target_np).to(scores.device)
-                order = torch.argsort(scores, descending=True)
-                target = target[order].float()
-                precision = torch.cumsum(target, dim=0) / torch.arange(
-                    1, target.numel() + 1, device=target.device, dtype=torch.float32)
-
+                target_bool = torch.from_numpy(target_np).to(scores.device)
                 if metric_cfg['map_k'] is None:
-                    ap_limit = target.numel()
-                    ap_denominator = target.sum()
+                    ap.append(retrieval_average_precision(scores.cpu(), target_bool.cpu()))
                 else:
-                    ap_limit = min(metric_cfg['map_k'], target.numel())
-                    ap_denominator = torch.clamp(target.sum(), max=float(ap_limit))
-                ap.append((precision[:ap_limit] * target[:ap_limit]).sum() / ap_denominator)
+                    top_k_actual = min(metric_cfg['map_k'], scores.numel())
+                    ap.append(retrieval_average_precision(scores.cpu(), target_bool.cpu(), top_k=top_k_actual).to(scores.device))
+
+                order = torch.argsort(scores, descending=True)
+                target = target_bool[order].float()
 
                 p_limit = min(metric_cfg['precision_k'], target.numel())
                 precision_at_k.append(target[:p_limit].sum() / float(p_limit))
